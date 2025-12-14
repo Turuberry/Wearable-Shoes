@@ -1,0 +1,333 @@
+#include <Wire.h>
+#include <MPU9250_asukiaaa.h>
+#include <MadgwickAHRS.h>
+#include <Preferences.h>
+#define OUT Serial  //(Unity)
+const int LOOP_HZ = 50;
+const int LOOP_MS = 1000 / LOOP_HZ;
+
+// --압력센서--
+const int PRESS_1_PIN = 34;
+const int PRESS_2_PIN = 35;
+const int PRESS_3_PIN = 32;
+const int PRESS_PINS[3] = {PRESS_1_PIN, PRESS_2_PIN, PRESS_3_PIN};
+
+// 전진 또는 정지 판단
+const float PRESS_INTENT_TH = 0.35f;
+const int PRESS_K = 2; // k-of-3: 2개 이상 눌리면 전진
+
+// 가중평균(총합: 1)
+const float W1 = 0.50f;
+const float W2 = 0.30f;
+const float W3 = 0.20f;
+
+// 캘리브레이션
+float pMin[3] = {4095,4095,4095};
+float pMax[3] = {0,0,0};
+float pN[3] = {0,0,0};      
+float pFilt[3] = {0,0,0};   
+const float PRESS_ALPHA = 0.20f; // 0이면 필터 OFF
+Preferences prefs;
+bool pressureReady = false;
+
+// --IMU--
+MPU9250_asukiaaa imu;
+Madgwick ahrs;
+
+// IMU offsets
+float accOffsetX=0, accOffsetY=0, accOffsetZ=0;
+float gyroOffsetX=0, gyroOffsetY=0, gyroOffsetZ=0;
+float magOffsetX=0, magOffsetY=0, magOffsetZ=0;
+float magScaleX=1, magScaleY=1, magScaleZ=1;
+
+// yaw state (relative)
+bool yawZeroed = false;
+float yawZero = 0.0f;
+const float YAW_RESET_TH = 65.0f; //65도를 최대로 설정
+
+static inline float wrap180(float a) {
+  while (a > 180.0f) a -= 360.0f;
+  while (a <= -180.0f) a += 360.0f;
+  return a;
+}
+static inline float absf(float v) { return v < 0 ? -v : v; }
+static inline float clamp01(float v){
+  if (v < 0) return 0;
+  if (v > 1) return 1;
+  return v;
+}
+
+// ---진동센서---
+const int MOTOR_1_PIN = 25;
+const int MOTOR_2_PIN = 26;
+const int MOTOR_3_PIN = 27;
+const int MOTOR_PINS[3] = {MOTOR_1_PIN, MOTOR_2_PIN, MOTOR_3_PIN};
+
+const unsigned long VIB_MS = 2000;
+bool vibActive = false;
+unsigned long vibStartMs = 0;
+
+// ---CALIBRATION---
+void calibratePressureMinMax(unsigned long prepMs=3000, unsigned long sampleMs=8000){
+  OUT.println("PRESSURE min/max calibration");
+  OUT.println("3초 후 시작. 8초 동안 발을 '떼기/누르기'를 반복해서 범위를 학습하세요");
+  delay(prepMs);
+
+  for(int i=0;i<3;i++){ pMin[i]=4095; pMax[i]=0; }
+
+  unsigned long t0 = millis();
+  while(millis() - t0 < sampleMs){
+    for(int i=0;i<3;i++){
+      int v = analogRead(PRESS_PINS[i]);
+      if(v < pMin[i]) pMin[i] = v;
+      if(v > pMax[i]) pMax[i] = v;
+    }
+    delay(10);
+  }
+
+  // guard
+  for(int i=0;i<3;i++){
+    if(pMax[i] - pMin[i] < 50){
+      pMin[i] -= 25;
+      pMax[i] += 25;
+    }
+    pFilt[i] = 0;
+  }
+
+  // save
+  prefs.begin("presscal", false);
+  prefs.putFloat("min1", pMin[0]); prefs.putFloat("max1", pMax[0]);
+  prefs.putFloat("min2", pMin[1]); prefs.putFloat("max2", pMax[1]);
+  prefs.putFloat("min3", pMin[2]); prefs.putFloat("max3", pMax[2]);
+  prefs.end();
+
+  OUT.printf("[CAL] P1 min/max = %.0f / %.0f\n", pMin[0], pMax[0]);
+  OUT.printf("[CAL] P2 min/max = %.0f / %.0f\n", pMin[1], pMax[1]);
+  OUT.printf("[CAL] P3 min/max = %.0f / %.0f\n", pMin[2], pMax[2]);
+
+  pressureReady = true;
+}
+
+bool loadPressureMinMax(){
+  prefs.begin("presscal", true);
+  float mn1 = prefs.getFloat("min1", -1);
+  float mx1 = prefs.getFloat("max1", -1);
+  float mn2 = prefs.getFloat("min2", -1);
+  float mx2 = prefs.getFloat("max2", -1);
+  float mn3 = prefs.getFloat("min3", -1);
+  float mx3 = prefs.getFloat("max3", -1);
+  prefs.end();
+
+  if(mn1 < 0 || mx1 < 0) return false;
+
+  pMin[0]=mn1; pMax[0]=mx1;
+  pMin[1]=mn2; pMax[1]=mx2;
+  pMin[2]=mn3; pMax[2]=mx3;
+  pressureReady = true;
+  return true;
+}
+
+void calibrateAccelGyro(uint16_t ms=3000){
+  OUT.println("IMU Acc/Gyro(정지상태 유지)");
+  accOffsetX=accOffsetY=accOffsetZ=0;
+  gyroOffsetX=gyroOffsetY=gyroOffsetZ=0;
+
+  uint32_t start = millis();
+  uint32_t n=0;
+  while(millis()-start < ms){
+    imu.accelUpdate();
+    imu.gyroUpdate();
+
+    accOffsetX += imu.accelX();
+    accOffsetY += imu.accelY();
+    accOffsetZ += imu.accelZ();
+
+    gyroOffsetX += imu.gyroX();
+    gyroOffsetY += imu.gyroY();
+    gyroOffsetZ += imu.gyroZ();
+
+    n++;
+    delay(5);
+  }
+  if(n==0) n=1;
+
+  accOffsetX /= n;
+  accOffsetY /= n;
+  accOffsetZ = (accOffsetZ / n) - 1.0f;
+
+  gyroOffsetX /= n;
+  gyroOffsetY /= n;
+  gyroOffsetZ /= n;
+
+  OUT.println("[CAL] IMU Acc/Gyro done");
+}
+
+void calibrateMag(uint16_t ms=12000){
+  OUT.println("[CAL] IMU Mag (구를 그리며 최대한 회전)");
+  float minX=1e9,minY=1e9,minZ=1e9;
+  float maxX=-1e9,maxY=-1e9,maxZ=-1e9;
+
+  uint32_t start = millis();
+  while(millis()-start < ms){
+    imu.magUpdate();
+    float mx = imu.magX();
+    float my = imu.magY();
+    float mz = imu.magZ();
+
+    if(mx<minX) minX=mx; if(mx>maxX) maxX=mx;
+    if(my<minY) minY=my; if(my>maxY) maxY=my;
+    if(mz<minZ) minZ=mz; if(mz>maxZ) maxZ=mz;
+
+    delay(5);
+  }
+
+  magOffsetX = (maxX+minX)*0.5f;
+  magOffsetY = (maxY+minY)*0.5f;
+  magOffsetZ = (maxZ+minZ)*0.5f;
+
+  float sx = (maxX-minX)*0.5f;
+  float sy = (maxY-minY)*0.5f;
+  float sz = (maxZ-minZ)*0.5f;
+  float avg = (sx+sy+sz)/3.0f;
+
+  if(sx<1e-6f) sx=1e-6f;
+  if(sy<1e-6f) sy=1e-6f;
+  if(sz<1e-6f) sz=1e-6f;
+
+  magScaleX = avg/sx;
+  magScaleY = avg/sy;
+  magScaleZ = avg/sz;
+
+  OUT.println("[CAL] IMU Mag done");
+}
+
+// ---MOTOR CONTROL---
+void motorsAll(bool on){
+  for(int i=0;i<3;i++){
+    digitalWrite(MOTOR_PINS[i], on ? HIGH : LOW);
+  }
+}
+
+// ---SETUP---
+void setup(){
+  OUT.begin(115200);
+  delay(300);
+
+  // motors
+  for(int i=0;i<3;i++){
+    pinMode(MOTOR_PINS[i], OUTPUT);
+    digitalWrite(MOTOR_PINS[i], LOW);
+  }
+
+  // ADC
+  analogReadResolution(12);
+  analogSetPinAttenuation(PRESS_1_PIN, ADC_11db);
+  analogSetPinAttenuation(PRESS_2_PIN, ADC_11db);
+  analogSetPinAttenuation(PRESS_3_PIN, ADC_11db);
+
+  // pressure calibration
+  if(!loadPressureMinMax()){
+    calibratePressureMinMax();
+  } else {
+    OUT.println("[CAL] Pressure min/max loaded from NVS");
+    OUT.printf("      P1 %.0f/%.0f, P2 %.0f/%.0f, P3 %.0f/%.0f\n",
+      pMin[0],pMax[0], pMin[1],pMax[1], pMin[2],pMax[2]);
+  }
+
+  // IMU
+  Wire.begin();
+  Wire.setClock(400000);
+
+  imu.setWire(&Wire);
+  imu.beginAccel();
+  imu.beginGyro();
+  imu.beginMag();
+
+  calibrateAccelGyro(3000);
+  calibrateMag(12000);
+
+  ahrs.begin((float)LOOP_HZ);
+
+  OUT.println("=== READY ===");
+  OUT.println("TX: SENS,FOOT,<0|1>,PWR,<0.00~1.00>,YAW,<deg>");
+  OUT.println("Note: yaw |>=65| => auto re-zero + 2s vibration (3 motors)");
+}
+
+// ---LOOP---
+void loop(){
+  static unsigned long lastMs = 0;
+  unsigned long now = millis();
+  if(now - lastMs < (unsigned long)LOOP_MS) return;
+  lastMs = now;
+
+  imu.accelUpdate();
+  imu.gyroUpdate();
+  imu.magUpdate();
+
+  float ax = imu.accelX() - accOffsetX;
+  float ay = imu.accelY() - accOffsetY;
+  float az = imu.accelZ() - accOffsetZ;
+
+  const float DEG2RAD = 3.1415926f / 180.0f;
+  float gx = (imu.gyroX() - gyroOffsetX) * DEG2RAD;
+  float gy = (imu.gyroY() - gyroOffsetY) * DEG2RAD;
+  float gz = (imu.gyroZ() - gyroOffsetZ) * DEG2RAD;
+
+  float mx = (imu.magX() - magOffsetX) * magScaleX;
+  float my = (imu.magY() - magOffsetY) * magScaleY;
+  float mz = (imu.magZ() - magOffsetZ) * magScaleZ;
+
+  ahrs.update(gx, gy, gz, ax, ay, az, mx, my, mz);
+
+  float yawRaw = wrap180(ahrs.getYaw());
+
+  if(!yawZeroed){
+    yawZero = yawRaw;
+    yawZeroed = true;
+  }
+
+  float yawRel = wrap180(yawRaw - yawZero);
+  // yaw값이 65도 이상이면 2초 진동센서 on 그리고 다시 0도 변경
+  if(!vibActive && absf(yawRel) >= YAW_RESET_TH){
+    yawZero = yawRaw;
+    yawRel = 0.0f; // 초기화
+
+    motorsAll(true);
+    vibActive = true; // vibrate start
+    vibStartMs = now;
+  }
+
+  // 진동센서 off
+  if(vibActive && (now - vibStartMs >= VIB_MS)){
+    motorsAll(false);
+    vibActive = false;
+  }
+
+  // ---압력센서 값 읽기---
+  float pIn[3];
+  for(int i=0;i<3;i++){
+    float v = (float)analogRead(PRESS_PINS[i]);
+    if(PRESS_ALPHA > 0.0f){
+      pFilt[i] = pFilt[i]*(1.0f - PRESS_ALPHA) + v*PRESS_ALPHA;
+      v = pFilt[i];
+    }
+
+    float denom = (pMax[i] - pMin[i]);
+    if(denom < 1.0f) denom = 1.0f;
+    pN[i] = clamp01((v - pMin[i]) / denom);
+    pIn[i] = pN[i];
+  }
+
+  int count = 0;
+  if(pIn[0] > PRESS_INTENT_TH) count++;
+  if(pIn[1] > PRESS_INTENT_TH) count++;
+  if(pIn[2] > PRESS_INTENT_TH) count++;
+
+  int foot = (count >= PRESS_K) ? 1 : 0;
+
+  float footPower = (W1*pIn[0] + W2*pIn[1] + W3*pIn[2]);
+  if(!foot) footPower = 0.0f;
+
+  //전송
+  OUT.printf("SENS,FOOT,%d,PWR,%.2f,YAW,%.2f\n", foot, footPower, yawRel);
+}
